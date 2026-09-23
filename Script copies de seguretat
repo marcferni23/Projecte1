@@ -1,0 +1,268 @@
+Primer esborrany de l'script per la gestió de les copies de seguretat
+
+#!/usr/bin/env bash
+#
+# backup.sh - Copias de seguridad automatizadas de base de datos y archivos del sistema
+#
+# Uso:
+#   sudo ./backup.sh              # usa /etc/backup.conf si existe
+#   CONFIG_FILE=/ruta/otro.conf ./backup.sh
+#
+# Cron (todos los dias a las 02:00):
+#   0 2 * * * root /usr/local/bin/backup.sh >/dev/null 2>&1
+#
+# El archivo de configuracion es codigo Bash que se "sourcea":
+# debe pertenecer a root y tener permisos 600.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+# ----------------------------------------------------------------------------
+# Configuracion por defecto (se puede sobrescribir en $CONFIG_FILE)
+# ----------------------------------------------------------------------------
+CONFIG_FILE="${CONFIG_FILE:-/etc/backup.conf}"
+
+BACKUP_DIR="/var/backups/auto"     # Destino local
+RETENTION_DAYS=14                  # Dias que se conservan las copias
+LOG_FILE="/var/log/backup.log"
+LOCK_FILE="/var/lock/backup.lock"
+
+# Base de datos: mysql | postgres | none
+DB_ENGINE="mysql"
+DB_HOST="localhost"
+DB_PORT=""                         # vacio = puerto por defecto
+DB_USER=""                         # vacio = usuario por defecto
+DB_NAMES=()                        # vacio = todas las bases de datos
+# Credenciales SIN pasarlas por linea de comandos:
+#   MySQL:    archivo con [client] user= / password=  (--defaults-extra-file)
+#   Postgres: archivo .pgpass                         (PGPASSFILE)
+DB_CREDENTIALS_FILE=""
+
+# Archivos del sistema
+FILES_TO_BACKUP=("/etc" "/var/www" "/home")
+EXCLUDES=("*.tmp" "*.cache" "*/node_modules" "*/.cache" "/home/*/.local/share/Trash")
+
+# Copia remota opcional (rsync sobre SSH), ej: "usuario@servidor:/backups/miequipo"
+REMOTE_DEST=""
+REMOTE_SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15"
+
+# Notificacion por correo en caso de error (requiere `mail`); vacio = desactivado
+NOTIFY_EMAIL=""
+
+# ----------------------------------------------------------------------------
+# Carga de configuracion externa
+# ----------------------------------------------------------------------------
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+# ----------------------------------------------------------------------------
+# Utilidades
+# ----------------------------------------------------------------------------
+TIMESTAMP="$(date +%Y-%m-%d_%H%M%S)"
+RUN_DIR="${BACKUP_DIR%/}/${TIMESTAMP}"
+HOSTNAME_SHORT="$(hostname -s)"
+STATUS="FALLIDO"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log() {
+    local level="$1"; shift
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "$level" "$*" | tee -a "$LOG_FILE"
+}
+
+notify() {
+    local subject="$1" body="$2"
+    if [[ -n "$NOTIFY_EMAIL" ]] && command -v mail >/dev/null 2>&1; then
+        printf '%s\n' "$body" | mail -s "$subject" "$NOTIFY_EMAIL" || \
+            log WARN "No se pudo enviar el correo de notificacion."
+    fi
+}
+
+on_error() {
+    log ERROR "Fallo en la linea $1 (codigo $2)."
+}
+
+on_exit() {
+    if [[ "$STATUS" != "OK" ]]; then
+        # Elimina la copia parcial para no dejar backups corruptos
+        [[ -d "$RUN_DIR" ]] && rm -rf "$RUN_DIR"
+        log ERROR "Backup finalizado con errores."
+        notify "[BACKUP FALLIDO] ${HOSTNAME_SHORT}" \
+               "El backup del ${TIMESTAMP} fallo. Revisa ${LOG_FILE}."
+    fi
+}
+
+trap 'on_error "$LINENO" "$?"' ERR
+trap on_exit EXIT
+
+check_deps() {
+    local deps=(tar gzip sha256sum find flock)
+    case "$DB_ENGINE" in
+        mysql)    deps+=(mysqldump) ;;
+        postgres) deps+=(pg_dump pg_dumpall) ;;
+        none)     ;;
+        *) log ERROR "DB_ENGINE invalido: '$DB_ENGINE' (mysql|postgres|none)"; exit 1 ;;
+    esac
+    [[ -n "$REMOTE_DEST" ]] && deps+=(rsync ssh)
+
+    local missing=()
+    for d in "${deps[@]}"; do
+        command -v "$d" >/dev/null 2>&1 || missing+=("$d")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        log ERROR "Faltan dependencias: ${missing[*]}"
+        exit 1
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Base de datos
+# ----------------------------------------------------------------------------
+dump_mysql() {
+    local args=(--single-transaction --quick --routines --triggers --events -h "$DB_HOST")
+    [[ -n "$DB_PORT" ]] && args+=(-P "$DB_PORT")
+    [[ -n "$DB_USER" ]] && args+=(-u "$DB_USER")
+    # --defaults-extra-file debe ser el primer argumento
+    [[ -n "$DB_CREDENTIALS_FILE" ]] && args=(--defaults-extra-file="$DB_CREDENTIALS_FILE" "${args[@]}")
+
+    if (( ${#DB_NAMES[@]} == 0 )); then
+        log INFO "Volcando todas las bases de datos MySQL/MariaDB..."
+        mysqldump "${args[@]}" --all-databases | gzip -9 > "${RUN_DIR}/db_all.sql.gz"
+    else
+        local db
+        for db in "${DB_NAMES[@]}"; do
+            log INFO "Volcando base de datos MySQL/MariaDB: ${db}"
+            mysqldump "${args[@]}" --databases "$db" | gzip -9 > "${RUN_DIR}/db_${db}.sql.gz"
+        done
+    fi
+}
+
+dump_postgres() {
+    local args=(-h "$DB_HOST")
+    [[ -n "$DB_PORT" ]] && args+=(-p "$DB_PORT")
+    [[ -n "$DB_USER" ]] && args+=(-U "$DB_USER")
+    [[ -n "$DB_CREDENTIALS_FILE" ]] && export PGPASSFILE="$DB_CREDENTIALS_FILE"
+
+    if (( ${#DB_NAMES[@]} == 0 )); then
+        log INFO "Volcando todas las bases de datos PostgreSQL..."
+        pg_dumpall "${args[@]}" | gzip -9 > "${RUN_DIR}/db_all.sql.gz"
+    else
+        local db
+        for db in "${DB_NAMES[@]}"; do
+            log INFO "Volcando base de datos PostgreSQL: ${db}"
+            pg_dump "${args[@]}" "$db" | gzip -9 > "${RUN_DIR}/db_${db}.sql.gz"
+        done
+    fi
+}
+
+backup_database() {
+    case "$DB_ENGINE" in
+        mysql)    dump_mysql ;;
+        postgres) dump_postgres ;;
+        none)     log INFO "Copia de base de datos desactivada (DB_ENGINE=none)." ;;
+    esac
+}
+
+# ----------------------------------------------------------------------------
+# Archivos del sistema
+# ----------------------------------------------------------------------------
+backup_files() {
+    local existing=() path
+    for path in "${FILES_TO_BACKUP[@]}"; do
+        if [[ -e "$path" ]]; then
+            existing+=("$path")
+        else
+            log WARN "La ruta no existe y se omite: $path"
+        fi
+    done
+    if (( ${#existing[@]} == 0 )); then
+        log WARN "No hay rutas validas que respaldar."
+        return 0
+    fi
+
+    local excl=() e
+    for e in "${EXCLUDES[@]}"; do excl+=(--exclude="$e"); done
+
+    local out="${RUN_DIR}/files_${HOSTNAME_SHORT}.tar.gz" rc=0
+    log INFO "Comprimiendo archivos: ${existing[*]}"
+    # tar devuelve 1 si algun archivo cambio durante la lectura (no es fatal)
+    tar --warning=no-file-changed --one-file-system --numeric-owner \
+        "${excl[@]}" -czf "$out" "${existing[@]}" 2>>"$LOG_FILE" || rc=$?
+    if (( rc > 1 )); then
+        log ERROR "tar fallo con codigo $rc"
+        return "$rc"
+    fi
+    (( rc == 1 )) && log WARN "Algunos archivos cambiaron durante la copia."
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Integridad, retencion y copia remota
+# ----------------------------------------------------------------------------
+create_checksums() {
+    log INFO "Generando sumas de verificacion SHA-256..."
+    ( cd "$RUN_DIR" && sha256sum ./* > SHA256SUMS )
+}
+
+verify_archives() {
+    log INFO "Verificando integridad de los archivos generados..."
+    local f
+    for f in "$RUN_DIR"/*.gz; do
+        [[ -e "$f" ]] || continue
+        gzip -t "$f"
+    done
+}
+
+rotate_backups() {
+    log INFO "Eliminando copias con mas de ${RETENTION_DAYS} dias..."
+    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d \
+        -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*' \
+        -mtime +"$RETENTION_DAYS" -print -exec rm -rf {} + | \
+        while read -r old; do log INFO "Eliminada: $old"; done
+}
+
+sync_remote() {
+    [[ -z "$REMOTE_DEST" ]] && return 0
+    log INFO "Sincronizando con destino remoto: ${REMOTE_DEST}"
+    rsync -az -e "ssh ${REMOTE_SSH_OPTS}" "$RUN_DIR" "${REMOTE_DEST%/}/"
+}
+
+# ----------------------------------------------------------------------------
+# Principal
+# ----------------------------------------------------------------------------
+main() {
+    # Evita ejecuciones simultaneas
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log ERROR "Ya hay otro backup en ejecucion."
+        exit 1
+    fi
+
+    log INFO "===== Inicio de backup (${HOSTNAME_SHORT}) ====="
+    check_deps
+    mkdir -p "$RUN_DIR"
+
+    # Comprobacion basica de espacio libre (minimo 1 GB)
+    local free_kb
+    free_kb="$(df -Pk "$BACKUP_DIR" | awk 'NR==2 {print $4}')"
+    if (( free_kb < 1048576 )); then
+        log ERROR "Espacio insuficiente en ${BACKUP_DIR} (< 1 GB libre)."
+        exit 1
+    fi
+
+    backup_database
+    backup_files
+    verify_archives
+    create_checksums
+    sync_remote
+    rotate_backups
+
+    STATUS="OK"
+    log INFO "Backup completado: ${RUN_DIR} ($(du -sh "$RUN_DIR" | cut -f1))"
+    log INFO "===== Fin de backup ====="
+}
+
+main "$@"
