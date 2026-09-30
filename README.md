@@ -4,3 +4,6 @@ Enllaç a trello
 
 Enllaç al document de google drive:
 (https://docs.google.com/document/d/1NnM4jywd5Ai8I-UkEqJsG_u8LMjssp-m15blw1erlsQ/edit?usp=sharing)
+
+Enllaç a la pàgina web
+http://192.168.116.4/wordpress7/
