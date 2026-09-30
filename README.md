@@ -5,5 +5,5 @@ https://trello.com/invite/b/6aac272544315066b143a97d/ATTI49b76ad5af6e2fe8f199c9d
 Enllaç al document de google drive:
 https://docs.google.com/document/d/1NnM4jywd5Ai8I-UkEqJsG_u8LMjssp-m15blw1erlsQ/edit?usp=sharing
 
-Enllaç a la pàgina web
+Enllaç a la pàgina web:
 http://192.168.116.4/wordpress7/
