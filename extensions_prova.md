@@ -1,1 +1,10 @@
-
+Attendant - Free AI Site Search & Chatbot
+https://es.wordpress.org/plugins/attendant/
+Cookie Bar
+https://wordpress.org/plugins/cookie-bar/
+Darkify
+https://es.wordpress.org/plugins/darkify/
+Joinchat - Enhanced "click to chat"
+https://es.wordpress.org/plugins/creame-whatsapp-me/
+WP Armour - Honeypot Anti Spam
+https://es.wordpress.org/plugins/honeypot/
